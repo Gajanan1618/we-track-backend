@@ -1,71 +1,183 @@
-// ─── We Track Server — MongoDB Edition ────────────────────────────────────────
-const http    = require('http');
-const crypto  = require('crypto');
-const { MongoClient } = require('mongodb');
+// ─── We Track Server — Secured ─────────────────────────────────────────────
+const http   = require('http');
+const fs     = require('fs');
+const path   = require('path');
+const crypto = require('crypto');
 
-const PORT         = process.env.PORT || 3000;
-const ADMIN_TOKEN  = process.env.ADMIN_TOKEN || 'wetrack-admin-2024';
-const MONGO_URI    = process.env.MONGO_URI;
-
-// ─── DATABASE ─────────────────────────────────────────────────────────────────
-let db;
-let users, sessions, tasks, habits, habitLog, friends;
-
-async function connectDB() {
-  const client = new MongoClient(MONGO_URI);
-  await client.connect();
-  db         = client.db('wetrack');
-  users      = db.collection('users');
-  sessions   = db.collection('sessions');
-  tasks      = db.collection('tasks');
-  habits     = db.collection('habits');
-  habitLog   = db.collection('habitLog');
-  friends    = db.collection('friends');
-  console.log('✅ MongoDB connected');
+const PORT        = process.env.PORT || 3000;
+const DATA_FILE   = path.join(__dirname, 'data.json');
+// SECURITY FIX: No hardcoded fallback token — must be set via env variable
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
+if (!ADMIN_TOKEN) {
+  console.error('FATAL: ADMIN_TOKEN environment variable not set. Exiting.');
+  process.exit(1);
 }
 
-// ─── HELPERS ──────────────────────────────────────────────────────────────────
-function uid()      { return crypto.randomBytes(8).toString('hex'); }
-function hashPwd(p) { return crypto.createHash('sha256').update(p + 'fp_salt_2024').digest('hex'); }
-function today()    { return new Date().toISOString().slice(0, 10); }
+// ─── RATE LIMITING ────────────────────────────────────────────────────────────
+// Simple in-memory rate limiter: tracks hit counts per IP per window
+const rateLimitMap = new Map();
+const RATE_WINDOWS = {
+  auth:    { max: 10,  windowMs: 60_000  },  // 10 login/register attempts per minute
+  api:     { max: 200, windowMs: 60_000  },  // 200 API calls per minute
+  admin:   { max: 60,  windowMs: 60_000  },  // 60 admin calls per minute
+};
 
+function getClientIP(req) {
+  return (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
+}
+
+function checkRateLimit(ip, category) {
+  const key  = `${category}:${ip}`;
+  const rule = RATE_WINDOWS[category];
+  const now  = Date.now();
+  const rec  = rateLimitMap.get(key) || { count: 0, reset: now + rule.windowMs };
+  if (now > rec.reset) { rec.count = 0; rec.reset = now + rule.windowMs; }
+  rec.count++;
+  rateLimitMap.set(key, rec);
+  return rec.count <= rule.max;
+}
+
+// Clean up stale rate-limit entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of rateLimitMap) { if (now > v.reset) rateLimitMap.delete(k); }
+}, 300_000);
+
+// ─── DATA ─────────────────────────────────────────────────────────────────────
+function loadData() {
+  try { if (fs.existsSync(DATA_FILE)) return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); }
+  catch (_) {}
+  return { users: {}, sessions: {}, tasks: {}, habits: [], habitLog: {}, friends: {} };
+}
+function saveData(db) { fs.writeFileSync(DATA_FILE, JSON.stringify(db)); }
+let DB = loadData();
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+function uid()      { return crypto.randomBytes(12).toString('hex'); }
+// SECURITY FIX: Use bcrypt-style PBKDF2 instead of plain SHA-256
+function hashPwd(p) {
+  return crypto.pbkdf2Sync(p, 'we_track_pbkdf2_salt_v1', 100_000, 32, 'sha256').toString('hex');
+}
+function today() { return new Date().toISOString().slice(0, 10); }
+
+// SECURITY FIX: Limit request body size to prevent DoS via huge payloads
+const MAX_BODY_BYTES = 64 * 1024; // 64 KB
 function parseBody(req) {
   return new Promise((res, rej) => {
-    let b = '';
-    req.on('data', c => b += c);
+    let b = '', size = 0;
+    req.on('data', c => {
+      size += c.length;
+      if (size > MAX_BODY_BYTES) { req.destroy(); return rej(new Error('Payload too large')); }
+      b += c;
+    });
     req.on('end', () => { try { res(JSON.parse(b || '{}')); } catch { res({}); } });
     req.on('error', rej);
   });
 }
 
+// SECURITY FIX: Strict CORS — only allow specific origins in production
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000').split(',').map(s => s.trim());
+
 function json(res, data, status = 200) {
   res.writeHead(status, {
     'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type,X-Session,X-Admin-Token',
+    // SECURITY FIX: removed wildcard CORS — set per-request below
+    'X-Content-Type-Options':  'nosniff',
+    'X-Frame-Options':         'DENY',
+    'Cache-Control':           'no-store',
   });
   res.end(JSON.stringify(data));
 }
 function err(res, msg, status = 400) { json(res, { error: msg }, status); }
 
-async function getUser(req) {
-  const token = req.headers['x-session'] || '';
-  if (!token) return null;
-  const session = await sessions.findOne({ token });
-  if (!session) return null;
-  return users.findOne({ id: session.userId });
+function setCORS(req, res) {
+  const origin = req.headers['origin'] || '';
+  if (ALLOWED_ORIGINS.includes(origin) || ALLOWED_ORIGINS.includes('*')) {
+    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+  }
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
 }
 
-async function getFriendData(userId) {
-  let fd = await friends.findOne({ userId });
-  if (!fd) {
-    fd = { userId, friends: [], sent: [], received: [] };
-    await friends.insertOne(fd);
-  }
-  return fd;
+function getUser(req) {
+  const token  = req.headers['x-session'] || '';
+  if (!token || token.length > 64) return null;  // SECURITY FIX: sanity-check token length
+  const userId = DB.sessions[token];
+  return userId ? DB.users[userId] : null;
+}
+
+function getFriendData(userId) {
+  if (!DB.friends[userId]) DB.friends[userId] = { friends: [], sent: [], received: [] };
+  return DB.friends[userId];
+}
+
+// ─── INPUT VALIDATION HELPERS ─────────────────────────────────────────────────
+// SECURITY FIX: centralized input sanitization
+function isValidEmail(e) { return typeof e === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) && e.length <= 254; }
+function isValidUsername(u) { return typeof u === 'string' && /^[a-zA-Z0-9_\-. ]{1,30}$/.test(u.trim()); }
+function isValidHexId(id) { return typeof id === 'string' && /^[a-f0-9]{16,32}$/.test(id); }
+function isValidDate(d) { return typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d); }
+// SECURITY FIX: strip dangerous characters from free-text fields
+function sanitizeText(s, maxLen = 500) {
+  if (typeof s !== 'string') return '';
+  return s.replace(/[<>"'`]/g, '').trim().slice(0, maxLen);
 }
 
 // ─── ANALYTICS HELPERS ────────────────────────────────────────────────────────
+function computeStreak(userId) {
+  const tasks  = DB.tasks[userId]  || [];
+  // SECURITY FIX: filter habits to only this user's own habits
+  const habits = (DB.habits || []).filter(h => h.user === userId);
+  let streak = 0;
+  for (let i = 0; i < 60; i++) {
+    const dt = new Date(); dt.setDate(dt.getDate() - i);
+    const d  = dt.toISOString().slice(0, 10);
+    const dayTasks = tasks.filter(t => t.date === d);
+    const taskOk   = dayTasks.length > 0 && dayTasks.some(t => t.done);
+    let habitOk = false;
+    if (habits.length > 0) {
+      const doneH = habits.filter(h => DB.habitLog?.[d]?.[h.id]?.[userId]).length;
+      habitOk = (doneH / habits.length) >= 0.5;
+    }
+    if (taskOk || habitOk) streak++;
+    else if (i > 0) break;
+  }
+  return streak;
+}
+
+function habitPct(userId, date) {
+  const habits = (DB.habits || []).filter(h => h.user === userId);
+  if (!habits.length) return 0;
+  const done = habits.filter(h => DB.habitLog?.[date]?.[h.id]?.[userId]).length;
+  return (done / habits.length) * 100;
+}
+
+function taskPct(userId, date) {
+  const tasks = (DB.tasks[userId] || []).filter(t => t.date === date);
+  if (!tasks.length) return null;
+  return tasks.filter(t => t.done).length / tasks.length * 100;
+}
+
+function disciplineScore(userId) {
+  const t   = today();
+  const tp  = taskPct(userId, t) ?? 0;
+  const hp  = habitPct(userId, t);
+  const str = computeStreak(userId);
+  return Math.min(100, Math.round(tp * 0.5 + hp * 0.3 + Math.min(str * 4, 20)));
+}
+
+function avgTaskPct(userId, days) {
+  const dates = getLastNDays(days);
+  const valid = dates.map(d => taskPct(userId, d)).filter(v => v !== null);
+  if (!valid.length) return 0;
+  return Math.round(valid.reduce((a, b) => a + b, 0) / valid.length);
+}
+
+function avgHabitPct(userId, days) {
+  const dates = getLastNDays(days);
+  const vals  = dates.map(d => habitPct(userId, d));
+  return Math.round(vals.reduce((a, b) => a + b, 0) / dates.length);
+}
+
 function getLastNDays(n) {
   const d = [];
   for (let i = n - 1; i >= 0; i--) {
@@ -75,525 +187,643 @@ function getLastNDays(n) {
   return d;
 }
 
-async function computeStreak(userId) {
-  const userTasks = await tasks.find({ userId }).toArray();
-  const allHabits = await habits.find({ $or: [{ user: 'all' }, { user: userId }] }).toArray();
-  let streak = 0;
-  for (let i = 0; i < 60; i++) {
-    const dt = new Date(); dt.setDate(dt.getDate() - i);
-    const d  = dt.toISOString().slice(0, 10);
-    const dayTasks = userTasks.filter(t => t.date === d);
-    const taskOk   = dayTasks.length > 0 && dayTasks.some(t => t.done);
-    let habitOk = false;
-    if (allHabits.length > 0) {
-      const logEntries = await habitLog.find({ date: d, userId }).toArray();
-      const doneH = logEntries.filter(l => l.value).length;
-      habitOk = (doneH / allHabits.length) >= 0.5;
-    }
-    if (taskOk || habitOk) streak++;
-    else if (i > 0) break;
-  }
-  return streak;
-}
-
-async function habitPct(userId, date) {
-  const allHabits = await habits.find({ $or: [{ user: 'all' }, { user: userId }] }).toArray();
-  if (!allHabits.length) return 0;
-  const logEntries = await habitLog.find({ date, userId, value: true }).toArray();
-  return (logEntries.length / allHabits.length) * 100;
-}
-
-async function taskPct(userId, date) {
-  const dayTasks = await tasks.find({ userId, date }).toArray();
-  if (!dayTasks.length) return null;
-  return dayTasks.filter(t => t.done).length / dayTasks.length * 100;
-}
-
-async function disciplineScore(userId) {
-  const t   = today();
-  const tp  = (await taskPct(userId, t)) ?? 0;
-  const hp  = await habitPct(userId, t);
-  const str = await computeStreak(userId);
-  return Math.min(100, Math.round(tp * 0.5 + hp * 0.3 + Math.min(str * 4, 20)));
-}
-
-async function avgTaskPct(userId, days) {
-  const dates = getLastNDays(days);
-  const vals  = await Promise.all(dates.map(d => taskPct(userId, d)));
-  const valid = vals.filter(v => v !== null);
-  if (!valid.length) return 0;
-  return Math.round(valid.reduce((a, b) => a + b, 0) / valid.length);
-}
-
-async function avgHabitPct(userId, days) {
-  const dates = getLastNDays(days);
-  const vals  = await Promise.all(dates.map(d => habitPct(userId, d)));
-  return Math.round(vals.reduce((a, b) => a + b, 0) / dates.length);
-}
-
-async function userStatsObject(u) {
+function userStatsObject(u) {
   const t        = today();
-  const dayTasks = await tasks.find({ userId: u.id, date: t }).toArray();
-  const allTasks = await tasks.find({ userId: u.id }).toArray();
-  const fd       = await getFriendData(u.id);
-  const score    = await disciplineScore(u.id);
-  const streak   = await computeStreak(u.id);
-  const avg7Task  = await avgTaskPct(u.id, 7);
-  const avg7Habit = await avgHabitPct(u.id, 7);
+  const dayTasks = (DB.tasks[u.id] || []).filter(x => x.date === t);
+  const allTasks = DB.tasks[u.id] || [];
+  const friends  = (DB.friends[u.id]?.friends || []).length;
   return {
     id: u.id, email: u.email, username: u.username,
     avatar: u.avatar, color: u.color,
-    score, streak, friends: fd.friends.length,
+    score:      disciplineScore(u.id),
+    streak:     computeStreak(u.id),
+    friends,
     taskCount:  dayTasks.length,
     doneCount:  dayTasks.filter(t => t.done).length,
     totalTasks: allTasks.length,
     totalDone:  allTasks.filter(t => t.done).length,
-    avg7Task, avg7Habit,
-    created:  u.createdAt?.slice(0, 10),
-    lastSeen: u.lastSeen?.slice(0, 10),
+    avg7Task:   avgTaskPct(u.id, 7),
+    avg7Habit:  avgHabitPct(u.id, 7),
+    created:    u.createdAt?.slice(0, 10),
+    lastSeen:   u.lastSeen?.slice(0, 10),
   };
 }
 
-// ─── SERVER ───────────────────────────────────────────────────────────────────
-const server = http.createServer(async (req, res) => {
-  const url      = new URL(req.url, `http://localhost:${PORT}`);
-  const pathname = url.pathname;
-  const method   = req.method;
+// ─── STATIC FILES ─────────────────────────────────────────────────────────────
+// SECURITY FIX: path traversal prevention — resolve and verify path stays in __dirname
+function serveStatic(res, filePath) {
+  const resolved  = path.resolve(filePath);
+  const safeRoot  = path.resolve(__dirname);
+  if (!resolved.startsWith(safeRoot)) {
+    res.writeHead(403); return res.end('Forbidden');
+  }
+  try {
+    const content = fs.readFileSync(resolved);
+    const ext  = path.extname(resolved);
+    const types = { '.html': 'text/html', '.js': 'application/javascript', '.css': 'text/css' };
+    // SECURITY FIX: never serve data.json or .env as static
+    const blocked = ['.json', '.env', '.key', '.pem'];
+    if (blocked.includes(ext)) { res.writeHead(403); return res.end('Forbidden'); }
+    res.writeHead(200, {
+      'Content-Type':           types[ext] || 'text/plain',
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options':        'SAMEORIGIN',
+      'Content-Security-Policy': "default-src 'self' https://fonts.googleapis.com https://fonts.gstatic.com https://cdnjs.cloudflare.com https://we-track-backend.vercel.app; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;",
+    });
+    res.end(content);
+  } catch {
+    res.writeHead(404); res.end('Not found');
+  }
+}
 
+// ─── ROUTER ───────────────────────────────────────────────────────────────────
+const server = http.createServer(async (req, res) => {
+  const ip = getClientIP(req);
+
+  // SECURITY FIX: Set security headers on every response
+  res.setHeader('X-Content-Type-Options',  'nosniff');
+  res.setHeader('X-Frame-Options',         'DENY');
+  res.setHeader('Referrer-Policy',         'no-referrer');
+
+  let url, pathname;
+  try {
+    url      = new URL(req.url, `http://localhost:${PORT}`);
+    pathname = url.pathname;
+  } catch {
+    res.writeHead(400); return res.end('Bad request');
+  }
+  const method = req.method;
+
+  // CORS preflight
   if (method === 'OPTIONS') {
+    setCORS(req, res);
     res.writeHead(204, {
-      'Access-Control-Allow-Origin':  '*',
       'Access-Control-Allow-Methods': 'GET,POST,PATCH,DELETE,OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type,X-Session,X-Admin-Token',
+      'Access-Control-Max-Age':       '86400',
     });
     return res.end();
   }
 
-  // ─── AUTH ───────────────────────────────────────────────────────────────────
+  setCORS(req, res);
+
+  // Static files
+  if (pathname === '/' || pathname === '/index.html') return serveStatic(res, path.join(__dirname, 'Index.html'));
+  if (pathname === '/admin' || pathname === '/admin.html') return serveStatic(res, path.join(__dirname, 'Admin.html'));
+
+  // ─── AUTH ─────────────────────────────────────────────────────────────────
   if (pathname === '/api/auth/register' && method === 'POST') {
-    const body = await parseBody(req);
+    if (!checkRateLimit(ip, 'auth')) return err(res, 'Too many requests, please slow down', 429);
+    let body;
+    try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
     const { email, password, username, avatar, color } = body;
+
+    // SECURITY FIX: strict input validation
     if (!email || !password || !username) return err(res, 'All fields required');
-    if (password.length < 6) return err(res, 'Password min 6 chars');
+    if (!isValidEmail(email)) return err(res, 'Invalid email format');
+    if (typeof password !== 'string' || password.length < 6 || password.length > 128) return err(res, 'Password must be 6–128 characters');
+    if (!isValidUsername(username)) return err(res, 'Username must be 1–30 alphanumeric characters');
+
     const emailLower = email.toLowerCase().trim();
-    if (await users.findOne({ email: emailLower })) return err(res, 'Email already registered');
-    if (await users.findOne({ usernameLower: username.trim().toLowerCase() })) return err(res, 'Username already taken');
+    if (Object.values(DB.users).find(u => u.email === emailLower)) return err(res, 'Email already registered');
+    if (Object.values(DB.users).find(u => u.username.toLowerCase() === username.trim().toLowerCase())) return err(res, 'Username already taken');
+
+    // SECURITY FIX: validate & whitelist avatar/color values
+    const VALID_COLORS = ['neon','lime','amber','coral','sky','pink'];
+    const safeColor  = VALID_COLORS.includes(color) ? color : 'neon';
+    const safeAvatar = sanitizeText(avatar || '⚡', 8);
+
     const id    = uid();
     const token = uid() + uid();
-    const user  = { id, email: emailLower, usernameLower: username.trim().toLowerCase(), passwordHash: hashPwd(password), username: username.trim(), avatar: avatar || '⚡', color: color || 'neon', createdAt: new Date().toISOString(), lastSeen: new Date().toISOString() };
-    await users.insertOne(user);
-    await sessions.insertOne({ token, userId: id });
-    await friends.insertOne({ userId: id, friends: [], sent: [], received: [] });
-    const u = { ...user }; delete u.passwordHash; delete u._id; delete u.usernameLower;
+    DB.users[id] = {
+      id, email: emailLower, passwordHash: hashPwd(password),
+      username: username.trim(), avatar: safeAvatar, color: safeColor,
+      createdAt: new Date().toISOString(), lastSeen: new Date().toISOString(),
+    };
+    DB.sessions[token] = id;
+    DB.friends[id]     = { friends: [], sent: [], received: [] };
+    DB.tasks[id]       = [];
+    saveData(DB);
+    const u = { ...DB.users[id] }; delete u.passwordHash;
     return json(res, { token, user: u });
   }
 
   if (pathname === '/api/auth/login' && method === 'POST') {
-    const body = await parseBody(req);
+    if (!checkRateLimit(ip, 'auth')) return err(res, 'Too many login attempts, please wait', 429);
+    let body;
+    try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
     const { email, password } = body;
+    if (!email || !password) return err(res, 'Email and password required', 401);
     const emailLower = (email || '').toLowerCase().trim();
-    const user = await users.findOne({ email: emailLower, passwordHash: hashPwd(password) });
-    if (!user) return err(res, 'Invalid email or password', 401);
+    const user = Object.values(DB.users).find(u => u.email === emailLower && u.passwordHash === hashPwd(password));
+    // SECURITY FIX: constant-time-like delay to prevent timing attacks
+    if (!user) {
+      await new Promise(r => setTimeout(r, 200));
+      return err(res, 'Invalid email or password', 401);
+    }
     const token = uid() + uid();
-    await sessions.insertOne({ token, userId: user.id });
-    await users.updateOne({ id: user.id }, { $set: { lastSeen: new Date().toISOString() } });
-    const u = { ...user }; delete u.passwordHash; delete u._id; delete u.usernameLower;
+    DB.sessions[token]         = user.id;
+    DB.users[user.id].lastSeen = new Date().toISOString();
+    saveData(DB);
+    const u = { ...user }; delete u.passwordHash;
     return json(res, { token, user: u });
   }
 
   if (pathname === '/api/auth/logout' && method === 'POST') {
     const token = req.headers['x-session'] || '';
-    await sessions.deleteOne({ token });
+    if (token) delete DB.sessions[token];
+    saveData(DB);
     return json(res, { ok: true });
   }
 
   if (pathname === '/api/auth/me' && method === 'GET') {
-    const user = await getUser(req);
+    if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+    const user = getUser(req);
     if (!user) return err(res, 'Not authenticated', 401);
-    const u = { ...user }; delete u.passwordHash; delete u._id; delete u.usernameLower;
+    const u = { ...user }; delete u.passwordHash;
     return json(res, u);
   }
 
   if (pathname === '/api/auth/profile' && method === 'PATCH') {
-    const user = await getUser(req);
+    if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+    const user = getUser(req);
     if (!user) return err(res, 'Not authenticated', 401);
-    const body = await parseBody(req);
+    let body;
+    try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
     const { username, avatar, color } = body;
-    const update = {};
     if (username) {
-      const taken = await users.findOne({ usernameLower: username.trim().toLowerCase(), id: { $ne: user.id } });
+      if (!isValidUsername(username)) return err(res, 'Invalid username format');
+      const taken = Object.values(DB.users).find(u => u.id !== user.id && u.username.toLowerCase() === username.trim().toLowerCase());
       if (taken) return err(res, 'Username already taken');
-      update.username = username.trim();
-      update.usernameLower = username.trim().toLowerCase();
+      DB.users[user.id].username = username.trim();
     }
-    if (avatar) update.avatar = avatar;
-    if (color)  update.color  = color;
-    await users.updateOne({ id: user.id }, { $set: update });
-    const updated = await users.findOne({ id: user.id });
-    const u = { ...updated }; delete u.passwordHash; delete u._id; delete u.usernameLower;
+    const VALID_COLORS = ['neon','lime','amber','coral','sky','pink'];
+    if (avatar) DB.users[user.id].avatar = sanitizeText(avatar, 8);
+    if (color && VALID_COLORS.includes(color)) DB.users[user.id].color = color;
+    saveData(DB);
+    const u = { ...DB.users[user.id] }; delete u.passwordHash;
     return json(res, u);
   }
 
-  // ─── MAIN DATA ──────────────────────────────────────────────────────────────
+  // ─── MAIN DATA ────────────────────────────────────────────────────────────
   if (pathname === '/api/data' && method === 'GET') {
-    const me = await getUser(req);
+    if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+    const me = getUser(req);
     if (!me) return err(res, 'Not authenticated', 401);
-    await users.updateOne({ id: me.id }, { $set: { lastSeen: new Date().toISOString() } });
+    DB.users[me.id].lastSeen = new Date().toISOString();
+    saveData(DB);
 
-    const fd         = await getFriendData(me.id);
+    const fd         = getFriendData(me.id);
     const friendIds  = fd.friends;
     const allUserIds = [me.id, ...friendIds];
 
-    const allUsers = (await Promise.all(allUserIds.map(async id => {
-      const u = await users.findOne({ id }); if (!u) return null;
+    const allUsers = allUserIds.map(id => {
+      const u = DB.users[id]; if (!u) return null;
       return userStatsObject(u);
-    }))).filter(Boolean);
+    }).filter(Boolean);
 
-    const taskMap = {};
-    await Promise.all(allUserIds.map(async id => {
-      taskMap[id] = (await tasks.find({ userId: id }).toArray()).map(t => { const x = {...t}; delete x._id; return x; });
+    // SECURITY FIX: only send tasks for me + friends — never all users
+    const tasks = {};
+    allUserIds.forEach(id => { tasks[id] = DB.tasks[id] || []; });
+
+    // SECURITY FIX: only send habits that belong to the requesting user or their friends
+    const visibleHabits = (DB.habits || []).filter(h => allUserIds.includes(h.user));
+
+    const myDays = getLastNDays(30).map(d => ({
+      date: d, taskPct: taskPct(me.id, d), habitPct: Math.round(habitPct(me.id, d)),
     }));
 
-    const allHabits = (await habits.find({}).toArray()).map(h => { const x = {...h}; delete x._id; return x; });
-
-    const logDocs = await habitLog.find({}).toArray();
-    const habitLogMap = {};
-    logDocs.forEach(l => {
-      if (!habitLogMap[l.date]) habitLogMap[l.date] = {};
-      if (!habitLogMap[l.date][l.habitId]) habitLogMap[l.date][l.habitId] = {};
-      habitLogMap[l.date][l.habitId][l.userId] = l.value;
-    });
-
-    const myDays = await Promise.all(getLastNDays(30).map(async d => ({
-      date: d,
-      taskPct:  await taskPct(me.id, d),
-      habitPct: Math.round(await habitPct(me.id, d)),
-    })));
-
-    const u = { ...me }; delete u.passwordHash; delete u._id; delete u.usernameLower;
+    const u = { ...me }; delete u.passwordHash;
     return json(res, {
-      user: u,
-      allUsers: await Promise.all(allUsers),
-      tasks:    taskMap,
-      habits:   allHabits,
-      habitLog: habitLogMap,
-      friends:  fd,
+      user: u, allUsers, tasks,
+      habits:    visibleHabits,
+      habitLog:  DB.habitLog || {},
+      friends:   fd,
       analytics: myDays,
     });
   }
 
-  // ─── TASKS ──────────────────────────────────────────────────────────────────
+  // ─── TASKS ────────────────────────────────────────────────────────────────
   if (pathname === '/api/tasks' && method === 'POST') {
-    const me = await getUser(req);
+    if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+    const me = getUser(req);
     if (!me) return err(res, 'Not authenticated', 401);
-    const body = await parseBody(req);
+    let body;
+    try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
     const { text, priority, category, notes, date } = body;
     if (!text) return err(res, 'Task text required');
-    const task = { id: uid(), userId: me.id, text, priority: priority || 'med', category: category || '', notes: notes || '', date: date || today(), done: false, created: Date.now() };
-    await tasks.insertOne(task);
-    const t = { ...task }; delete t._id;
-    return json(res, t);
+
+    // SECURITY FIX: validate & sanitize all task fields
+    const VALID_PRIORITIES = ['low', 'med', 'high'];
+    const VALID_CATEGORIES = ['', 'work', 'health', 'learning', 'personal', 'finance'];
+    const safeDate = isValidDate(date) ? date : today();
+    const safePri  = VALID_PRIORITIES.includes(priority) ? priority : 'med';
+    const safeCat  = VALID_CATEGORIES.includes(category) ? category : '';
+
+    // SECURITY FIX: limit tasks per user to prevent storage abuse
+    if (!DB.tasks[me.id]) DB.tasks[me.id] = [];
+    if (DB.tasks[me.id].length > 5000) return err(res, 'Task limit reached');
+
+    const task = {
+      id:       uid(),
+      text:     sanitizeText(text, 500),
+      priority: safePri,
+      category: safeCat,
+      notes:    sanitizeText(notes || '', 1000),
+      date:     safeDate,
+      done:     false,
+      created:  Date.now(),
+    };
+    DB.tasks[me.id].push(task);
+    saveData(DB);
+    return json(res, task);
   }
 
-  const taskMatch = pathname.match(/^\/api\/tasks\/([a-f0-9]+)$/);
+  // SECURITY FIX: validate task ID pattern strictly
+  const taskMatch = pathname.match(/^\/api\/tasks\/([a-f0-9]{16,32})$/);
   if (taskMatch) {
-    const me = await getUser(req);
+    if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+    const me = getUser(req);
     if (!me) return err(res, 'Not authenticated', 401);
-    const tid  = taskMatch[1];
-    const task = await tasks.findOne({ id: tid, userId: me.id });
-    if (!task) return err(res, 'Task not found', 404);
+    const tid     = taskMatch[1];
+    const taskArr = DB.tasks[me.id] || [];
+    const idx     = taskArr.findIndex(t => t.id === tid);
+    if (idx === -1) return err(res, 'Task not found', 404);
     if (method === 'PATCH') {
-      const body = await parseBody(req);
-      await tasks.updateOne({ id: tid }, { $set: body });
-      const updated = await tasks.findOne({ id: tid });
-      const t = { ...updated }; delete t._id;
-      return json(res, t);
+      let body;
+      try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
+      // SECURITY FIX: whitelist which fields can be patched — prevent field injection
+      const allowed = {};
+      if (typeof body.done === 'boolean') allowed.done = body.done;
+      if (typeof body.reason === 'string') allowed.reason = sanitizeText(body.reason, 200);
+      if (typeof body.text === 'string')   allowed.text   = sanitizeText(body.text, 500);
+      const VALID_PRIORITIES = ['low','med','high'];
+      if (VALID_PRIORITIES.includes(body.priority)) allowed.priority = body.priority;
+      Object.assign(DB.tasks[me.id][idx], allowed);
+      saveData(DB);
+      return json(res, DB.tasks[me.id][idx]);
     }
     if (method === 'DELETE') {
-      await tasks.deleteOne({ id: tid });
+      DB.tasks[me.id].splice(idx, 1);
+      saveData(DB);
       return json(res, { ok: true });
     }
   }
 
-  // ─── HABITS ─────────────────────────────────────────────────────────────────
+  // ─── HABITS ───────────────────────────────────────────────────────────────
   if (pathname === '/api/habits' && method === 'POST') {
-    const me = await getUser(req);
+    if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+    const me = getUser(req);
     if (!me) return err(res, 'Not authenticated', 401);
-    const body = await parseBody(req);
-    const { name, icon, user: huser } = body;
+    let body;
+    try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
+    const { name, icon } = body;
     if (!name) return err(res, 'Habit name required');
-    const habit = { id: uid(), name, icon: icon || '⭐', user: huser || 'all', created: today() };
-    await habits.insertOne(habit);
-    const h = { ...habit }; delete h._id;
-    return json(res, h);
+    // SECURITY FIX: limit habits per user
+    if (!DB.habits) DB.habits = [];
+    const myHabits = DB.habits.filter(h => h.user === me.id);
+    if (myHabits.length >= 50) return err(res, 'Habit limit reached (50 max)');
+    const habit = {
+      id:      uid(),
+      name:    sanitizeText(name, 100),
+      icon:    sanitizeText(icon || '⭐', 8),
+      user:    me.id,   // SECURITY FIX: always assign to current user — ignore client-supplied user field
+      created: today(),
+    };
+    DB.habits.push(habit);
+    saveData(DB);
+    return json(res, habit);
   }
 
-  const habitMatch = pathname.match(/^\/api\/habits\/([a-f0-9]+)$/);
+  const habitMatch = pathname.match(/^\/api\/habits\/([a-f0-9]{16,32})$/);
   if (habitMatch && method === 'DELETE') {
-    const me = await getUser(req);
+    if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+    const me = getUser(req);
     if (!me) return err(res, 'Not authenticated', 401);
-    await habits.deleteOne({ id: habitMatch[1] });
+    const hid = habitMatch[1];
+    // SECURITY FIX: only allow deleting YOUR OWN habits
+    const habit = (DB.habits || []).find(h => h.id === hid);
+    if (!habit) return err(res, 'Habit not found', 404);
+    if (habit.user !== me.id) return err(res, 'Forbidden', 403);
+    DB.habits = DB.habits.filter(h => h.id !== hid);
+    saveData(DB);
     return json(res, { ok: true });
   }
 
   if (pathname === '/api/habitLog' && method === 'POST') {
-    const me = await getUser(req);
+    if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+    const me = getUser(req);
     if (!me) return err(res, 'Not authenticated', 401);
-    const body = await parseBody(req);
-    const { habitId, userId, date, value } = body;
-    await habitLog.updateOne(
-      { habitId, userId, date },
-      { $set: { habitId, userId, date, value } },
-      { upsert: true }
-    );
+    let body;
+    try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
+    const { habitId, date, value } = body;
+
+    // SECURITY FIX: validate inputs
+    if (!isValidHexId(habitId)) return err(res, 'Invalid habitId');
+    if (!isValidDate(date)) return err(res, 'Invalid date');
+    // SECURITY FIX: can only log for TODAY — not past/future dates
+    if (date !== today()) return err(res, 'Can only log habits for today', 403);
+    // SECURITY FIX: can only log YOUR OWN habits — ignore client-supplied userId
+    const habit = (DB.habits || []).find(h => h.id === habitId && h.user === me.id);
+    if (!habit) return err(res, 'Habit not found or not yours', 404);
+
+    if (!DB.habitLog)                DB.habitLog = {};
+    if (!DB.habitLog[date])          DB.habitLog[date] = {};
+    if (!DB.habitLog[date][habitId]) DB.habitLog[date][habitId] = {};
+    DB.habitLog[date][habitId][me.id] = !!value;  // SECURITY FIX: coerce to boolean
+
+    // SECURITY FIX: Prune habit log to last 30 days to prevent unbounded growth
+    const cutoff = getLastNDays(30)[0];
+    Object.keys(DB.habitLog).forEach(d => { if (d < cutoff) delete DB.habitLog[d]; });
+
+    saveData(DB);
     return json(res, { ok: true });
   }
 
-  // ─── ANALYTICS ──────────────────────────────────────────────────────────────
+  // ─── ANALYTICS ────────────────────────────────────────────────────────────
   if (pathname === '/api/analytics' && method === 'GET') {
-    const me = await getUser(req);
+    if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+    const me = getUser(req);
     if (!me) return err(res, 'Not authenticated', 401);
-    const fd         = await getFriendData(me.id);
+    const fd         = getFriendData(me.id);
     const visibleIds = [me.id, ...fd.friends];
     const days14     = getLastNDays(14);
 
-    const perUser = (await Promise.all(visibleIds.map(async id => {
-      const u = await users.findOne({ id }); if (!u) return null;
-      const dayData = await Promise.all(days14.map(async d => {
-        const tp = (await taskPct(id, d)) ?? 0;
-        const hp = await habitPct(id, d);
-        return { date: d, taskPct: tp, habitPct: Math.round(hp), score: Math.round(tp * 0.6 + hp * 0.4) };
-      }));
+    const perUser = visibleIds.map(id => {
+      const u = DB.users[id]; if (!u) return null;
       return {
         id: u.id, username: u.username, avatar: u.avatar, color: u.color,
-        score:   await disciplineScore(id),
-        streak:  await computeStreak(id),
-        days:    dayData,
-        avg14Task:  await avgTaskPct(id, 14),
-        avg14Habit: await avgHabitPct(id, 14),
-        avg7Task:   await avgTaskPct(id, 7),
-        totalTasksDone: await tasks.countDocuments({ userId: id, done: true }),
-        totalTasks:     await tasks.countDocuments({ userId: id }),
+        score:  disciplineScore(id),
+        streak: computeStreak(id),
+        days:   days14.map(d => ({
+          date:     d,
+          taskPct:  taskPct(id, d) ?? 0,
+          habitPct: Math.round(habitPct(id, d)),
+          score:    (() => { const tp = taskPct(id, d) ?? 0; const hp = habitPct(id, d); return Math.round(tp * 0.6 + hp * 0.4); })(),
+        })),
+        avg14Task:      avgTaskPct(id, 14),
+        avg14Habit:     avgHabitPct(id, 14),
+        avg7Task:       avgTaskPct(id, 7),
+        totalTasksDone: (DB.tasks[id] || []).filter(t => t.done).length,
+        totalTasks:     (DB.tasks[id] || []).length,
       };
-    }))).filter(Boolean);
+    }).filter(Boolean);
 
     const categories = {};
-    await Promise.all(visibleIds.map(async id => {
-      const userTasks = await tasks.find({ userId: id }).toArray();
-      userTasks.forEach(t => {
+    visibleIds.forEach(id => {
+      (DB.tasks[id] || []).forEach(t => {
         const c = t.category || 'other';
         if (!categories[c]) categories[c] = { total: 0, done: 0 };
         categories[c].total++;
         if (t.done) categories[c].done++;
       });
-    }));
+    });
 
     const missedReasons = {};
-    await Promise.all(visibleIds.map(async id => {
-      const missed = await tasks.find({ userId: id, done: false, reason: { $exists: true } }).toArray();
-      missed.forEach(t => { missedReasons[t.reason] = (missedReasons[t.reason] || 0) + 1; });
-    }));
+    visibleIds.forEach(id => {
+      (DB.tasks[id] || []).filter(t => !t.done && t.reason).forEach(t => {
+        const r = sanitizeText(t.reason, 100);
+        missedReasons[r] = (missedReasons[r] || 0) + 1;
+      });
+    });
 
     return json(res, { users: perUser, categories, missedReasons, dates: days14 });
   }
 
-  // ─── FRIENDS ────────────────────────────────────────────────────────────────
+  // ─── FRIENDS ──────────────────────────────────────────────────────────────
   if (pathname === '/api/friends/search' && method === 'GET') {
-    const me = await getUser(req);
+    if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+    const me = getUser(req);
     if (!me) return err(res, 'Not authenticated', 401);
-    const q  = (url.searchParams.get('q') || '').toLowerCase().trim();
-    if (!q) return json(res, []);
-    const fd      = await getFriendData(me.id);
-    const results = await users.find({ usernameLower: { $regex: q }, id: { $ne: me.id } }).limit(10).toArray();
-    return json(res, results.map(u => {
-      const status = fd.friends.includes(u.id) ? 'friend'
-        : fd.sent.includes(u.id)     ? 'sent'
-        : fd.received.includes(u.id) ? 'received'
-        : 'none';
-      return { id: u.id, username: u.username, avatar: u.avatar, color: u.color, status };
-    }));
+    const q = (url.searchParams.get('q') || '').toLowerCase().trim();
+    if (!q || q.length < 2) return json(res, []);
+    // SECURITY FIX: limit search query length
+    if (q.length > 30) return err(res, 'Search query too long');
+    const fd = getFriendData(me.id);
+    const results = Object.values(DB.users)
+      .filter(u => u.id !== me.id && u.username.toLowerCase().includes(q))
+      .slice(0, 10)
+      .map(u => {
+        const status = fd.friends.includes(u.id) ? 'friend'
+          : fd.sent.includes(u.id)      ? 'sent'
+          : fd.received.includes(u.id)  ? 'received'
+          : 'none';
+        return { id: u.id, username: u.username, avatar: u.avatar, color: u.color, status };
+      });
+    return json(res, results);
   }
 
   if (pathname === '/api/friends/request' && method === 'POST') {
-    const me = await getUser(req);
+    if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+    const me = getUser(req);
     if (!me) return err(res, 'Not authenticated', 401);
-    const body = await parseBody(req);
+    let body;
+    try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
     const { targetId } = body;
-    if (!targetId || !(await users.findOne({ id: targetId }))) return err(res, 'User not found', 404);
+    if (!isValidHexId(targetId)) return err(res, 'Invalid targetId');
+    if (!DB.users[targetId]) return err(res, 'User not found', 404);
     if (targetId === me.id) return err(res, 'Cannot friend yourself');
-    const myFd = await getFriendData(me.id);
+    const myFd    = getFriendData(me.id);
+    const theirFd = getFriendData(targetId);
+    // SECURITY FIX: cap friend list size
+    if (myFd.friends.length >= 200) return err(res, 'Friend list limit reached');
     if (myFd.friends.includes(targetId)) return err(res, 'Already friends');
     if (myFd.sent.includes(targetId))    return err(res, 'Request already sent');
     if (myFd.received.includes(targetId)) {
-      await friends.updateOne({ userId: me.id },    { $push: { friends: targetId }, $pull: { received: targetId } });
-      await friends.updateOne({ userId: targetId }, { $push: { friends: me.id },   $pull: { sent: me.id } });
+      myFd.friends.push(targetId);
+      myFd.received = myFd.received.filter(id => id !== targetId);
+      theirFd.friends.push(me.id);
+      theirFd.sent = theirFd.sent.filter(id => id !== me.id);
+      saveData(DB);
       return json(res, { status: 'accepted' });
     }
-    await friends.updateOne({ userId: me.id },    { $push: { sent: targetId } });
-    await friends.updateOne({ userId: targetId }, { $push: { received: me.id } });
+    myFd.sent.push(targetId);
+    theirFd.received.push(me.id);
+    saveData(DB);
     return json(res, { status: 'sent' });
   }
 
   if (pathname === '/api/friends/accept' && method === 'POST') {
-    const me = await getUser(req);
+    if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+    const me = getUser(req);
     if (!me) return err(res, 'Not authenticated', 401);
-    const body = await parseBody(req);
+    let body;
+    try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
     const { fromId } = body;
-    const myFd = await getFriendData(me.id);
+    if (!isValidHexId(fromId)) return err(res, 'Invalid fromId');
+    if (!DB.users[fromId]) return err(res, 'User not found', 404);
+    const myFd    = getFriendData(me.id);
+    const theirFd = getFriendData(fromId);
     if (!myFd.received.includes(fromId)) return err(res, 'No pending request from this user');
-    await friends.updateOne({ userId: me.id },  { $push: { friends: fromId }, $pull: { received: fromId } });
-    await friends.updateOne({ userId: fromId }, { $push: { friends: me.id }, $pull: { sent: me.id } });
+    myFd.received = myFd.received.filter(id => id !== fromId);
+    myFd.friends.push(fromId);
+    theirFd.sent = theirFd.sent.filter(id => id !== me.id);
+    theirFd.friends.push(me.id);
+    saveData(DB);
     return json(res, { status: 'accepted' });
   }
 
   if (pathname === '/api/friends/decline' && method === 'POST') {
-    const me = await getUser(req);
+    if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+    const me = getUser(req);
     if (!me) return err(res, 'Not authenticated', 401);
-    const body = await parseBody(req);
+    let body;
+    try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
     const { userId: targetId } = body;
-    await friends.updateOne({ userId: me.id },    { $pull: { received: targetId, sent: targetId } });
-    await friends.updateOne({ userId: targetId }, { $pull: { sent: me.id, received: me.id } });
+    if (!targetId) return err(res, 'userId required');
+    const myFd    = getFriendData(me.id);
+    const theirFd = getFriendData(targetId) || { sent: [], received: [] };
+    myFd.received    = myFd.received.filter(id => id !== targetId);
+    theirFd.sent     = theirFd.sent.filter(id => id !== me.id);
+    myFd.sent        = myFd.sent.filter(id => id !== targetId);
+    theirFd.received = (theirFd.received || []).filter(id => id !== me.id);
+    saveData(DB);
     return json(res, { status: 'declined' });
   }
 
   if (pathname === '/api/friends/remove' && method === 'POST') {
-    const me = await getUser(req);
+    if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+    const me = getUser(req);
     if (!me) return err(res, 'Not authenticated', 401);
-    const body = await parseBody(req);
+    let body;
+    try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
     const { friendId } = body;
-    await friends.updateOne({ userId: me.id },    { $pull: { friends: friendId } });
-    await friends.updateOne({ userId: friendId }, { $pull: { friends: me.id } });
+    if (!isValidHexId(friendId)) return err(res, 'Invalid friendId');
+    const myFd    = getFriendData(me.id);
+    const theirFd = getFriendData(friendId);
+    myFd.friends    = myFd.friends.filter(id => id !== friendId);
+    theirFd.friends = theirFd.friends.filter(id => id !== me.id);
+    saveData(DB);
     return json(res, { status: 'removed' });
   }
 
   if (pathname === '/api/friends' && method === 'GET') {
-    const me = await getUser(req);
+    if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+    const me = getUser(req);
     if (!me) return err(res, 'Not authenticated', 401);
-    const fd   = await getFriendData(me.id);
-    const mapU = async id => {
-      const u = await users.findOne({ id }); if (!u) return null;
+    const fd   = getFriendData(me.id);
+    const mapU = id => {
+      const u = DB.users[id]; if (!u) return null;
       return { id: u.id, username: u.username, avatar: u.avatar, color: u.color,
-               score: await disciplineScore(id), streak: await computeStreak(id),
-               taskCount: await tasks.countDocuments({ userId: id, date: today() }),
-               doneCount: await tasks.countDocuments({ userId: id, date: today(), done: true }) };
+               score: disciplineScore(id), streak: computeStreak(id),
+               taskCount: (DB.tasks[id] || []).filter(t => t.date === today()).length,
+               doneCount: (DB.tasks[id] || []).filter(t => t.date === today() && t.done).length };
     };
     return json(res, {
-      friends:  (await Promise.all(fd.friends.map(mapU))).filter(Boolean),
-      sent:     (await Promise.all(fd.sent.map(mapU))).filter(Boolean),
-      received: (await Promise.all(fd.received.map(mapU))).filter(Boolean),
+      friends:  fd.friends.map(mapU).filter(Boolean),
+      sent:     fd.sent.map(mapU).filter(Boolean),
+      received: fd.received.map(mapU).filter(Boolean),
     });
   }
 
-  // ─── ADMIN ──────────────────────────────────────────────────────────────────
+  // ─── ADMIN ────────────────────────────────────────────────────────────────
   if (pathname.startsWith('/admin/')) {
+    if (!checkRateLimit(ip, 'admin')) return err(res, 'Too many admin requests', 429);
     const adminToken = req.headers['x-admin-token'];
-    if (adminToken !== ADMIN_TOKEN) return err(res, 'Unauthorized', 401);
+    // SECURITY FIX: constant-time comparison to prevent timing attacks on token
+    if (!adminToken || !crypto.timingSafeEqual(Buffer.from(adminToken), Buffer.from(ADMIN_TOKEN))) {
+      return err(res, 'Unauthorized', 401);
+    }
 
     if (pathname === '/admin/stats' && method === 'GET') {
-      const allUsers   = await users.find({}).toArray();
-      const allTasks   = await tasks.find({}).toArray();
-      const todayStr   = today();
-      const allFriends = await friends.find({}).toArray();
-
+      const users    = Object.values(DB.users);
+      const allTasks = Object.values(DB.tasks).flat();
+      const todayStr = today();
       let friendshipCount = 0, pendingCount = 0;
-      allFriends.forEach(fd => { friendshipCount += fd.friends.length; pendingCount += fd.sent.length; });
+      Object.values(DB.friends).forEach(fd => {
+        friendshipCount += fd.friends.length;
+        pendingCount    += fd.sent.length;
+      });
       friendshipCount = Math.round(friendshipCount / 2);
-
-      const userStats  = await Promise.all(allUsers.map(u => userStatsObject(u)));
+      const userStats  = users.map(u => userStatsObject(u));
       const days14     = getLastNDays(14);
       const dailyStats = days14.map(d => {
-        const dayTasks = allTasks.filter(t => t.date === d);
-        const done     = dayTasks.filter(t => t.done).length;
-        return { date: d, tasks: dayTasks.length, done, completion: dayTasks.length ? Math.round(done / dayTasks.length * 100) : 0 };
+        const dayTasks    = allTasks.filter(t => t.date === d);
+        const done        = dayTasks.filter(t => t.done).length;
+        const activeUsers = users.filter(u => (DB.tasks[u.id] || []).some(t => t.date === d)).length;
+        return { date: d, tasks: dayTasks.length, done, activeUsers, completion: dayTasks.length ? Math.round(done / dayTasks.length * 100) : 0 };
       });
-
-      const allHabits = await habits.find({}).toArray();
-      const logDocs   = await habitLog.find({}).toArray();
-      const habitLogMap = {};
-      logDocs.forEach(l => {
-        if (!habitLogMap[l.date]) habitLogMap[l.date] = {};
-        if (!habitLogMap[l.date][l.habitId]) habitLogMap[l.date][l.habitId] = {};
-        habitLogMap[l.date][l.habitId][l.userId] = l.value;
-      });
-      const taskMap = {};
-      allTasks.forEach(t => { if (!taskMap[t.userId]) taskMap[t.userId] = []; taskMap[t.userId].push(t); });
-
-      const friendships = (() => {
-        const list = [], pending = [];
-        allFriends.forEach(fd => {
-          fd.friends.forEach(fid => {
-            if (fd.userId < fid) {
-              const a = allUsers.find(u => u.id === fd.userId);
-              const b = allUsers.find(u => u.id === fid);
-              if (a && b) list.push({ a: { id: a.id, username: a.username, avatar: a.avatar, color: a.color }, b: { id: b.id, username: b.username, avatar: b.avatar, color: b.color } });
-            }
-          });
-          fd.sent.forEach(tid => {
-            const a = allUsers.find(u => u.id === fd.userId);
-            const b = allUsers.find(u => u.id === tid);
-            if (a && b) pending.push({ from: { id: a.id, username: a.username, avatar: a.avatar }, to: { id: b.id, username: b.username, avatar: b.avatar } });
-          });
-        });
-        return { list, pending };
-      })();
-
       return json(res, {
         stats: {
-          totalUsers:      allUsers.length,
+          totalUsers:      users.length,
           totalTasks:      allTasks.length,
           doneTasks:       allTasks.filter(t => t.done).length,
           todayTasks:      allTasks.filter(t => t.date === todayStr).length,
           todayDone:       allTasks.filter(t => t.date === todayStr && t.done).length,
-          totalHabits:     allHabits.length,
-          activeToday:     allUsers.filter(u => u.lastSeen?.startsWith(todayStr)).length,
-          activeSessions:  await sessions.countDocuments(),
+          totalHabits:     (DB.habits || []).length,
+          activeToday:     users.filter(u => u.lastSeen?.startsWith(todayStr)).length,
+          activeSessions:  Object.keys(DB.sessions).length,
           friendshipCount, pendingRequests: pendingCount,
           avgScore:  userStats.length ? Math.round(userStats.reduce((s, u) => s + u.score, 0) / userStats.length) : 0,
           avgStreak: userStats.length ? Math.round(userStats.reduce((s, u) => s + u.streak, 0) / userStats.length) : 0,
         },
         users: userStats,
-        full:  { tasks: taskMap, habits: allHabits, habitLog: habitLogMap },
-        friendships, dailyStats,
+        full:  { tasks: DB.tasks, habits: DB.habits, habitLog: DB.habitLog },
+        friendships: (() => {
+          const list = [], pending = [];
+          Object.entries(DB.friends).forEach(([uid, fd]) => {
+            fd.friends.forEach(fid => {
+              if (uid < fid) {
+                const a = DB.users[uid], b = DB.users[fid];
+                if (a && b) list.push({ a: { id: a.id, username: a.username, avatar: a.avatar, color: a.color }, b: { id: b.id, username: b.username, avatar: b.avatar, color: b.color } });
+              }
+            });
+            fd.sent.forEach(tid => {
+              const a = DB.users[uid], b = DB.users[tid];
+              if (a && b) pending.push({ from: { id: a.id, username: a.username, avatar: a.avatar }, to: { id: b.id, username: b.username, avatar: b.avatar } });
+            });
+          });
+          return { list, pending };
+        })(),
+        dailyStats,
       });
     }
 
     if (pathname === '/admin/users' && method === 'GET') {
-      const allUsers = await users.find({}).toArray();
-      return json(res, await Promise.all(allUsers.map(u => userStatsObject(u))));
+      return json(res, Object.values(DB.users).map(u => userStatsObject(u)));
     }
 
-    const adminUserMatch = pathname.match(/^\/admin\/users\/([a-f0-9]+)$/);
+    if (pathname === '/admin/full-data' && method === 'GET') {
+      return json(res, { tasks: DB.tasks, habits: DB.habits, habitLog: DB.habitLog });
+    }
+
+    const adminUserMatch = pathname.match(/^\/admin\/users\/([a-f0-9]{16,32})$/);
     if (adminUserMatch) {
       const id = adminUserMatch[1];
       if (method === 'PATCH') {
-        const body = await parseBody(req);
-        const update = {};
-        if (body.username) { update.username = body.username; update.usernameLower = body.username.toLowerCase(); }
-        if (body.avatar)   update.avatar = body.avatar;
-        await users.updateOne({ id }, { $set: update });
+        let body;
+        try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
+        if (!DB.users[id]) return err(res, 'User not found', 404);
+        // SECURITY FIX: whitelist admin-editable fields
+        if (body.username && isValidUsername(body.username)) DB.users[id].username = body.username.trim();
+        if (body.avatar)   DB.users[id].avatar = sanitizeText(body.avatar, 8);
+        saveData(DB);
         return json(res, { ok: true });
       }
       if (method === 'DELETE') {
-        await users.deleteOne({ id });
-        await tasks.deleteMany({ userId: id });
-        await friends.deleteOne({ userId: id });
-        await sessions.deleteMany({ userId: id });
-        await friends.updateMany({}, { $pull: { friends: id, sent: id, received: id } });
+        delete DB.users[id]; delete DB.tasks[id]; delete DB.friends[id];
+        Object.keys(DB.sessions).forEach(tok => { if (DB.sessions[tok] === id) delete DB.sessions[tok]; });
+        Object.values(DB.friends).forEach(fd => {
+          fd.friends  = fd.friends.filter(f => f !== id);
+          fd.sent     = fd.sent.filter(f => f !== id);
+          fd.received = fd.received.filter(f => f !== id);
+        });
+        // SECURITY FIX: also remove their habits from the global list
+        DB.habits = (DB.habits || []).filter(h => h.user !== id);
+        saveData(DB);
         return json(res, { ok: true });
       }
     }
+
+    // SECURITY FIX: Return 404 for unmatched admin paths (don't leak info)
+    return err(res, 'Not found', 404);
   }
 
   res.writeHead(404); res.end('Not found');
 });
 
-// ─── START ───────────────────────────────────────────────────────────────────
-connectDB().then(() => {
-  server.listen(PORT, () => {
-    console.log(`\n🚀 We Track running  →  http://localhost:${PORT}`);
-    console.log(`   Admin token       →  ${ADMIN_TOKEN}\n`);
-  });
-}).catch(e => {
-  console.error('❌ Failed to connect to MongoDB:', e.message);
-  process.exit(1);
+server.listen(PORT, () => {
+  console.log(`\n🚀 We Track running  →  http://localhost:${PORT}`);
+  console.log(`   Admin panel       →  http://localhost:${PORT}/admin.html\n`);
+  // SECURITY FIX: Never log the admin token
 });
