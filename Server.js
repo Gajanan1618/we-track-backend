@@ -79,8 +79,14 @@ function parseBody(req) {
   });
 }
 
-// SECURITY FIX: Strict CORS — only allow specific origins in production
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000').split(',').map(s => s.trim());
+// SECURITY FIX: Strict CORS — allowlist your actual frontend origins
+// Set ALLOWED_ORIGINS env variable as comma-separated list, e.g.:
+//   ALLOWED_ORIGINS=https://we-trackk.netlify.app,http://localhost:3000
+const ALLOWED_ORIGINS = (
+  process.env.ALLOWED_ORIGINS || 'https://we-trackk.netlify.app,http://localhost:3000'
+).split(',').map(s => s.trim()).filter(Boolean);
+
+console.log('✅ CORS allowed origins:', ALLOWED_ORIGINS.join(', '));
 
 function json(res, data, status = 200) {
   res.writeHead(status, {
@@ -96,10 +102,14 @@ function err(res, msg, status = 400) { json(res, { error: msg }, status); }
 
 function setCORS(req, res) {
   const origin = req.headers['origin'] || '';
-  if (ALLOWED_ORIGINS.includes(origin) || ALLOWED_ORIGINS.includes('*')) {
-    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+  if (ALLOWED_ORIGINS.includes(origin)) {
+    // Only grant CORS access to explicitly allowed origins
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Vary', 'Origin');
   }
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  // If origin is not in the allowlist, no Access-Control-Allow-Origin header is set,
+  // which causes the browser to block the response — that is the correct behavior.
 }
 
 function getUser(req) {
