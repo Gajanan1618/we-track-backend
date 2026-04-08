@@ -7,10 +7,14 @@ const crypto = require('crypto');
 const PORT        = process.env.PORT || 3000;
 const DATA_FILE   = path.join(__dirname, 'data.json');
 // SECURITY FIX: No hardcoded fallback token — must be set via env variable
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
+// SECURITY: Use env variable in production; falls back to a generated token for local dev
+let ADMIN_TOKEN = process.env.ADMIN_TOKEN;
 if (!ADMIN_TOKEN) {
-  console.error('FATAL: ADMIN_TOKEN environment variable not set. Exiting.');
-  process.exit(1);
+  const crypto = require('crypto');
+  ADMIN_TOKEN = crypto.randomBytes(24).toString('hex');
+  console.warn('\n⚠️  ADMIN_TOKEN not set — generated a one-time token for this session:');
+  console.warn('   ADMIN_TOKEN =', ADMIN_TOKEN);
+  console.warn('   Set ADMIN_TOKEN env variable to use a fixed token in production.\n');
 }
 
 // ─── RATE LIMITING ────────────────────────────────────────────────────────────
