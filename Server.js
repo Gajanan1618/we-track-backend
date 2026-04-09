@@ -59,7 +59,12 @@ let DB = loadData();
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 function uid()      { return crypto.randomBytes(12).toString('hex'); }
 // SECURITY FIX: Use bcrypt-style PBKDF2 instead of plain SHA-256
+function hashPwdSHA256(p) {
+  // Legacy hash — used before security upgrade
+  return crypto.createHash('sha256').update(p + 'fp_salt_2024').digest('hex');
+}
 function hashPwd(p) {
+  // Secure hash — PBKDF2 with 100k iterations
   return crypto.pbkdf2Sync(p, 'we_track_pbkdf2_salt_v1', 100_000, 32, 'sha256').toString('hex');
 }
 function today() { return new Date().toISOString().slice(0, 10); }
@@ -329,8 +334,18 @@ const server = http.createServer(async (req, res) => {
     const { email, password } = body;
     if (!email || !password) return err(res, 'Email and password required', 401);
     const emailLower = (email || '').toLowerCase().trim();
-    const user = Object.values(DB.users).find(u => u.email === emailLower && u.passwordHash === hashPwd(password));
-    // SECURITY FIX: constant-time-like delay to prevent timing attacks
+    // Try new PBKDF2 hash first, then fall back to legacy SHA-256 (auto-migrates old accounts)
+    let user = Object.values(DB.users).find(u => u.email === emailLower && u.passwordHash === hashPwd(password));
+    if (!user) {
+      // Check if this is an old account with SHA-256 hash
+      const legacyUser = Object.values(DB.users).find(u => u.email === emailLower && u.passwordHash === hashPwdSHA256(password));
+      if (legacyUser) {
+        // Auto-migrate: upgrade their hash to PBKDF2 silently
+        DB.users[legacyUser.id].passwordHash = hashPwd(password);
+        user = legacyUser;
+        console.log('Migrated password hash for user:', legacyUser.id);
+      }
+    }
     if (!user) {
       await new Promise(r => setTimeout(r, 200));
       return err(res, 'Invalid email or password', 401);
