@@ -35,12 +35,14 @@ async function connectDB() {
   await client.connect();
   db = client.db(DB_NAME);
   col = {
-    users:    db.collection('users'),
-    sessions: db.collection('sessions'),
-    tasks:    db.collection('tasks'),
-    habits:   db.collection('habits'),
-    habitLog: db.collection('habitLog'),
-    friends:  db.collection('friends'),
+    users:        db.collection('users'),
+    sessions:     db.collection('sessions'),
+    tasks:        db.collection('tasks'),
+    habits:       db.collection('habits'),
+    habitLog:     db.collection('habitLog'),
+    friends:      db.collection('friends'),
+    teams:        db.collection('teams'),
+    teamMessages: db.collection('teamMessages'),
   };
   // Indexes for performance & uniqueness
   await col.users.createIndex({ email: 1 },    { unique: true });
@@ -52,6 +54,8 @@ async function connectDB() {
   await col.habitLog.createIndex({ habitId: 1, userId: 1, date: 1 }, { unique: true });
   await col.habitLog.createIndex({ date: 1 });
   await col.friends.createIndex({ userId: 1 }, { unique: true });
+  await col.teams.createIndex({ members: 1 });
+  await col.teamMessages.createIndex({ teamId: 1, created: 1 });
   console.log('✅ MongoDB connected:', DB_NAME);
 }
 
@@ -465,22 +469,27 @@ const server = http.createServer(async (req, res) => {
     const me = await getUser(req);
     if (!me) return err(res, 'Not authenticated', 401);
     let body; try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
-    const { text, priority, category, notes, date } = body;
+    const { text, priority, category, notes, date, visibility, likes, supports, reminds, comments } = body;
     if (!text) return err(res, 'Task text required');
 
     const taskCount = await col.tasks.countDocuments({ userId: me.id });
     if (taskCount >= 5000) return err(res, 'Task limit reached');
 
     const task = {
-      id:       uid(),
-      userId:   me.id,
-      text:     sanitizeText(text, 500),
-      priority: VALID_PRIORITIES.includes(priority) ? priority : 'med',
-      category: VALID_CATEGORIES.includes(category) ? category : '',
-      notes:    sanitizeText(notes || '', 1000),
-      date:     isValidDate(date) ? date : today(),
-      done:     false,
-      created:  Date.now(),
+      id:         uid(),
+      userId:     me.id,
+      text:       sanitizeText(text, 500),
+      priority:   VALID_PRIORITIES.includes(priority) ? priority : 'med',
+      category:   VALID_CATEGORIES.includes(category) ? category : '',
+      notes:      sanitizeText(notes || '', 1000),
+      date:       isValidDate(date) ? date : today(),
+      visibility: visibility === 'public' ? 'public' : 'private',
+      likes:      typeof likes === 'number' ? Math.max(0, likes) : 0,
+      supports:   typeof supports === 'number' ? Math.max(0, supports) : 0,
+      reminds:    typeof reminds === 'number' ? Math.max(0, reminds) : 0,
+      comments:   typeof comments === 'number' ? Math.max(0, comments) : 0,
+      done:       false,
+      created:    Date.now(),
     };
     await col.tasks.insertOne(task);
     const r = {...task}; delete r._id;
@@ -502,6 +511,14 @@ const server = http.createServer(async (req, res) => {
       if (typeof body.reason === 'string')    allowed.reason   = sanitizeText(body.reason, 200);
       if (typeof body.text === 'string')      allowed.text     = sanitizeText(body.text, 500);
       if (VALID_PRIORITIES.includes(body.priority)) allowed.priority = body.priority;
+      if (VALID_CATEGORIES.includes(body.category)) allowed.category = body.category;
+      if (typeof body.notes === 'string')     allowed.notes    = sanitizeText(body.notes, 1000);
+      if (isValidDate(body.date))             allowed.date     = body.date;
+      if (body.visibility === 'public' || body.visibility === 'private') allowed.visibility = body.visibility;
+      if (typeof body.likes === 'number')     allowed.likes    = Math.max(0, body.likes);
+      if (typeof body.supports === 'number') allowed.supports  = Math.max(0, body.supports);
+      if (typeof body.reminds === 'number')   allowed.reminds  = Math.max(0, body.reminds);
+      if (typeof body.comments === 'number') allowed.comments = Math.max(0, body.comments);
       await col.tasks.updateOne({ id: tid }, { $set: allowed });
       const updated = await col.tasks.findOne({ id: tid });
       const r = {...updated}; delete r._id;
@@ -720,6 +737,149 @@ const server = http.createServer(async (req, res) => {
       sent:     (await Promise.all(fd.sent.map(mapU))).filter(Boolean),
       received: (await Promise.all(fd.received.map(mapU))).filter(Boolean),
     });
+  }
+
+  // ─── TEAMS ──────────────────────────────────────────────────────────────────
+  if (pathname === '/api/teams' && method === 'POST') {
+    if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+    const me = await getUser(req);
+    if (!me) return err(res, 'Not authenticated', 401);
+    let body; try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
+    const { name } = body;
+    if (!name || name.length < 1 || name.length > 50) return err(res, 'Team name required (1-50 chars)');
+
+    const teamCount = await col.teams.countDocuments({ members: me.id });
+    if (teamCount >= 10) return err(res, 'Team limit reached (10 max)');
+
+    const team = {
+      id:       uid(),
+      name:     sanitizeText(name, 50),
+      ownerId:  me.id,
+      members:  [me.id],
+      created:  Date.now(),
+    };
+    await col.teams.insertOne(team);
+    const r = {...team}; delete r._id;
+    return json(res, r);
+  }
+
+  if (pathname === '/api/teams' && method === 'GET') {
+    if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+    const me = await getUser(req);
+    if (!me) return err(res, 'Not authenticated', 401);
+    const teams = await col.teams.find({ members: me.id }).toArray();
+    const teamsSafe = teams.map(t => { const r = {...t}; delete r._id; return r; });
+    return json(res, teamsSafe);
+  }
+
+  const teamMatch = pathname.match(/^\/api\/teams\/([a-f0-9]{24})$/);
+  if (teamMatch) {
+    const teamId = teamMatch[1];
+    if (method === 'GET') {
+      if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+      const me = await getUser(req);
+      if (!me) return err(res, 'Not authenticated', 401);
+      const team = await col.teams.findOne({ id: teamId, members: me.id });
+      if (!team) return err(res, 'Team not found', 404);
+      const r = {...team}; delete r._id;
+      return json(res, r);
+    }
+
+    if (method === 'PATCH') {
+      if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+      const me = await getUser(req);
+      if (!me) return err(res, 'Not authenticated', 401);
+      let body; try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
+      const { name } = body;
+      const team = await col.teams.findOne({ id: teamId, ownerId: me.id });
+      if (!team) return err(res, 'Team not found or not owner', 404);
+      if (name && name.length >= 1 && name.length <= 50) {
+        await col.teams.updateOne({ id: teamId }, { $set: { name: sanitizeText(name, 50) } });
+      }
+      const updated = await col.teams.findOne({ id: teamId });
+      const r = {...updated}; delete r._id;
+      return json(res, r);
+    }
+
+    if (method === 'DELETE') {
+      if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+      const me = await getUser(req);
+      if (!me) return err(res, 'Not authenticated', 401);
+      const team = await col.teams.findOne({ id: teamId, ownerId: me.id });
+      if (!team) return err(res, 'Team not found or not owner', 404);
+      await col.teams.deleteOne({ id: teamId });
+      await col.teamMessages.deleteMany({ teamId });
+      return json(res, { ok: true });
+    }
+  }
+
+  if (pathname.startsWith('/api/teams/') && method === 'POST') {
+    const parts = pathname.split('/');
+    if (parts.length === 4 && parts[3] === 'invite') {
+      if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+      const me = await getUser(req);
+      if (!me) return err(res, 'Not authenticated', 401);
+      let body; try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
+      const { teamId, userId } = body;
+      const team = await col.teams.findOne({ id: teamId, ownerId: me.id });
+      if (!team) return err(res, 'Team not found or not owner', 404);
+      if (team.members.length >= 20) return err(res, 'Team member limit reached (20 max)');
+      if (team.members.includes(userId)) return err(res, 'User already in team');
+      const user = await col.users.findOne({ id: userId });
+      if (!user) return err(res, 'User not found', 404);
+      await col.teams.updateOne({ id: teamId }, { $push: { members: userId } });
+      return json(res, { ok: true });
+    }
+
+    if (parts.length === 4 && parts[3] === 'leave') {
+      if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+      const me = await getUser(req);
+      if (!me) return err(res, 'Not authenticated', 401);
+      let body; try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
+      const { teamId } = body;
+      const team = await col.teams.findOne({ id: teamId, members: me.id });
+      if (!team) return err(res, 'Team not found', 404);
+      if (team.ownerId === me.id) return err(res, 'Owner cannot leave team, delete instead');
+      await col.teams.updateOne({ id: teamId }, { $pull: { members: me.id } });
+      return json(res, { ok: true });
+    }
+
+    if (parts.length === 4 && parts[3] === 'messages') {
+      if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+      const me = await getUser(req);
+      if (!me) return err(res, 'Not authenticated', 401);
+      let body; try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
+      const { teamId, text } = body;
+      if (!text || text.length > 500) return err(res, 'Message text required (max 500 chars)');
+      const team = await col.teams.findOne({ id: teamId, members: me.id });
+      if (!team) return err(res, 'Team not found', 404);
+
+      const message = {
+        id:       uid(),
+        teamId,
+        userId:   me.id,
+        text:     sanitizeText(text, 500),
+        created:  Date.now(),
+      };
+      await col.teamMessages.insertOne(message);
+      const r = {...message}; delete r._id;
+      return json(res, r);
+    }
+  }
+
+  if (pathname.startsWith('/api/teams/') && method === 'GET') {
+    const parts = pathname.split('/');
+    if (parts.length === 4 && parts[3] === 'messages') {
+      if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+      const me = await getUser(req);
+      if (!me) return err(res, 'Not authenticated', 401);
+      const teamId = parts[2];
+      const team = await col.teams.findOne({ id: teamId, members: me.id });
+      if (!team) return err(res, 'Team not found', 404);
+      const messages = await col.teamMessages.find({ teamId }).sort({ created: 1 }).limit(100).toArray();
+      const messagesSafe = messages.map(m => { const r = {...m}; delete r._id; return r; });
+      return json(res, messagesSafe);
+    }
   }
 
   // ─── ADMIN ──────────────────────────────────────────────────────────────────
