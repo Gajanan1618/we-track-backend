@@ -43,6 +43,7 @@ async function connectDB() {
     friends:      db.collection('friends'),
     teams:        db.collection('teams'),
     teamMessages: db.collection('teamMessages'),
+    teamFiles:    db.collection('teamFiles'),
   };
   // Indexes for performance & uniqueness
   await col.users.createIndex({ email: 1 },    { unique: true });
@@ -55,7 +56,9 @@ async function connectDB() {
   await col.habitLog.createIndex({ date: 1 });
   await col.friends.createIndex({ userId: 1 }, { unique: true });
   await col.teams.createIndex({ members: 1 });
+  await col.teams.createIndex({ inviteCode: 1 }, { sparse: true });
   await col.teamMessages.createIndex({ teamId: 1, created: 1 });
+  await col.teamFiles.createIndex({ teamId: 1, created: 1 });
   console.log('✅ MongoDB connected:', DB_NAME);
 }
 
@@ -102,7 +105,7 @@ function getLastNDays(n) {
   return d;
 }
 
-const MAX_BODY = 64 * 1024;
+const MAX_BODY = 8 * 1024 * 1024; // 8MB for file uploads
 function parseBody(req) {
   return new Promise((res, rej) => {
     let b = '', size = 0;
@@ -745,21 +748,55 @@ const server = http.createServer(async (req, res) => {
     const me = await getUser(req);
     if (!me) return err(res, 'Not authenticated', 401);
     let body; try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
-    const { name } = body;
+    const { name, emoji, desc, password } = body;
     if (!name || name.length < 1 || name.length > 50) return err(res, 'Team name required (1-50 chars)');
 
     const teamCount = await col.teams.countDocuments({ members: me.id });
     if (teamCount >= 10) return err(res, 'Team limit reached (10 max)');
 
+    // Generate a short invite code
+    const inviteCode = crypto.randomBytes(4).toString('hex').toUpperCase();
+    const passHash = password ? crypto.createHash('sha256').update(password + 'team_salt_v1').digest('hex') : null;
+
+    const ownerUser = await col.users.findOne({ id: me.id });
     const team = {
-      id:       uid(),
-      name:     sanitizeText(name, 50),
-      ownerId:  me.id,
-      members:  [me.id],
-      created:  Date.now(),
+      id:          uid(),
+      name:        sanitizeText(name, 50),
+      emoji:       sanitizeText(emoji || '🚀', 8),
+      desc:        sanitizeText(desc || '', 200),
+      ownerId:     me.id,
+      ownerName:   ownerUser?.username || 'Unknown',
+      members:     [me.id],
+      inviteCode,
+      passHash,
+      hasPassword: !!password,
+      created:     Date.now(),
     };
     await col.teams.insertOne(team);
-    const r = {...team}; delete r._id;
+    const r = {...team}; delete r._id; delete r.passHash;
+    return json(res, r);
+  }
+
+  // Join team by invite code
+  if (pathname === '/api/teams/join' && method === 'POST') {
+    if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+    const me = await getUser(req);
+    if (!me) return err(res, 'Not authenticated', 401);
+    let body; try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
+    const { inviteCode, password } = body;
+    if (!inviteCode) return err(res, 'Invite code required');
+    const team = await col.teams.findOne({ inviteCode: inviteCode.toUpperCase().trim() });
+    if (!team) return err(res, 'Invalid invite code');
+    if (team.members.includes(me.id)) return err(res, 'Already in this team');
+    if (team.members.length >= 20) return err(res, 'Team is full (20 max)');
+    // Check password if set
+    if (team.passHash) {
+      const ph = crypto.createHash('sha256').update((password || '') + 'team_salt_v1').digest('hex');
+      if (ph !== team.passHash) return err(res, 'Wrong password');
+    }
+    await col.teams.updateOne({ id: team.id }, { $push: { members: me.id } });
+    const updated = await col.teams.findOne({ id: team.id });
+    const r = {...updated}; delete r._id; delete r.passHash;
     return json(res, r);
   }
 
@@ -768,8 +805,17 @@ const server = http.createServer(async (req, res) => {
     const me = await getUser(req);
     if (!me) return err(res, 'Not authenticated', 401);
     const teams = await col.teams.find({ members: me.id }).toArray();
-    const teamsSafe = teams.map(t => { const r = {...t}; delete r._id; return r; });
-    return json(res, teamsSafe);
+    // Enrich with member info
+    const enriched = await Promise.all(teams.map(async t => {
+      const memberUsers = await Promise.all(t.members.map(async mid => {
+        const u = await col.users.findOne({ id: mid });
+        return u ? { id: u.id, username: u.username, avatar: u.avatar, color: u.color, isOwner: mid === t.ownerId } : null;
+      }));
+      const r = {...t, memberDetails: memberUsers.filter(Boolean)};
+      delete r._id; delete r.passHash;
+      return r;
+    }));
+    return json(res, enriched);
   }
 
   const teamMatch = pathname.match(/^\/api\/teams\/([a-f0-9]{24})$/);
@@ -781,7 +827,11 @@ const server = http.createServer(async (req, res) => {
       if (!me) return err(res, 'Not authenticated', 401);
       const team = await col.teams.findOne({ id: teamId, members: me.id });
       if (!team) return err(res, 'Team not found', 404);
-      const r = {...team}; delete r._id;
+      const memberUsers = await Promise.all(team.members.map(async mid => {
+        const u = await col.users.findOne({ id: mid });
+        return u ? { id: u.id, username: u.username, avatar: u.avatar, color: u.color, isOwner: mid === team.ownerId } : null;
+      }));
+      const r = {...team, memberDetails: memberUsers.filter(Boolean)}; delete r._id; delete r.passHash;
       return json(res, r);
     }
 
@@ -797,7 +847,7 @@ const server = http.createServer(async (req, res) => {
         await col.teams.updateOne({ id: teamId }, { $set: { name: sanitizeText(name, 50) } });
       }
       const updated = await col.teams.findOne({ id: teamId });
-      const r = {...updated}; delete r._id;
+      const r = {...updated}; delete r._id; delete r.passHash;
       return json(res, r);
     }
 
@@ -809,20 +859,84 @@ const server = http.createServer(async (req, res) => {
       if (!team) return err(res, 'Team not found or not owner', 404);
       await col.teams.deleteOne({ id: teamId });
       await col.teamMessages.deleteMany({ teamId });
+      await col.teamFiles.deleteMany({ teamId });
       return json(res, { ok: true });
     }
   }
 
-  if (pathname.startsWith('/api/teams/') && method === 'POST') {
-    const parts = pathname.split('/');
-    if (parts.length === 4 && parts[3] === 'invite') {
-      if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
-      const me = await getUser(req);
-      if (!me) return err(res, 'Not authenticated', 401);
+  // Team sub-routes: /api/teams/:id/messages  /api/teams/:id/files  /api/teams/:id/leave
+  const teamSubPostMatch = pathname.match(/^\/api\/teams\/([a-f0-9]{24})\/(messages|files|leave|members)$/);
+  if (teamSubPostMatch && method === 'POST') {
+    if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+    const me = await getUser(req);
+    if (!me) return err(res, 'Not authenticated', 401);
+    const teamId   = teamSubPostMatch[1];
+    const subRoute = teamSubPostMatch[2];
+    const team = await col.teams.findOne({ id: teamId, members: me.id });
+    if (!team) return err(res, 'Team not found', 404);
+
+    if (subRoute === 'messages') {
       let body; try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
-      const { teamId, userId } = body;
-      const team = await col.teams.findOne({ id: teamId, ownerId: me.id });
-      if (!team) return err(res, 'Team not found or not owner', 404);
+      const { text, fileId, fileType, fileName } = body;
+      if (!text && !fileId) return err(res, 'Message text or fileId required');
+      if (text && text.length > 2000) return err(res, 'Message too long (max 2000 chars)');
+      const senderUser = await col.users.findOne({ id: me.id });
+      const message = {
+        id:          uid(),
+        teamId,
+        userId:      me.id,
+        username:    senderUser?.username || 'Unknown',
+        avatar:      senderUser?.avatar || '?',
+        color:       senderUser?.color || 'neon',
+        text:        text ? sanitizeText(text, 2000) : '',
+        fileId:      fileId || null,
+        fileType:    fileType || null,
+        fileName:    fileName ? sanitizeText(fileName, 200) : null,
+        created:     Date.now(),
+      };
+      await col.teamMessages.insertOne(message);
+      const r = {...message}; delete r._id;
+      return json(res, r);
+    }
+
+    if (subRoute === 'files') {
+      let body; try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
+      const { name, type, data, size } = body;
+      if (!name || !data) return err(res, 'File name and data required');
+      if (size > 5 * 1024 * 1024) return err(res, 'File too large (max 5MB)');
+      const allowedTypes = ['image/jpeg','image/png','image/gif','image/webp','application/pdf',
+        'text/plain','application/msword','application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'application/vnd.ms-excel','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'];
+      if (type && !allowedTypes.includes(type)) return err(res, 'File type not allowed');
+      const senderUser = await col.users.findOne({ id: me.id });
+      const file = {
+        id:       uid(),
+        teamId,
+        userId:   me.id,
+        username: senderUser?.username || 'Unknown',
+        name:     sanitizeText(name, 200),
+        type:     type || 'application/octet-stream',
+        data,     // base64 encoded
+        size:     size || 0,
+        created:  Date.now(),
+      };
+      await col.teamFiles.insertOne(file);
+      const r = {...file}; delete r._id; delete r.data; // don't return data in response
+      r.url = `/api/teams/${teamId}/files/${r.id}`;
+      return json(res, r);
+    }
+
+    if (subRoute === 'leave') {
+      if (team.ownerId === me.id) return err(res, 'Owner cannot leave, delete team instead');
+      await col.teams.updateOne({ id: teamId }, { $pull: { members: me.id } });
+      return json(res, { ok: true });
+    }
+
+    if (subRoute === 'members') {
+      // Add member (owner only)
+      if (team.ownerId !== me.id) return err(res, 'Only owner can add members', 403);
+      let body; try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
+      const { userId } = body;
       if (team.members.length >= 20) return err(res, 'Team member limit reached (20 max)');
       if (team.members.includes(userId)) return err(res, 'User already in team');
       const user = await col.users.findOne({ id: userId });
@@ -830,56 +944,53 @@ const server = http.createServer(async (req, res) => {
       await col.teams.updateOne({ id: teamId }, { $push: { members: userId } });
       return json(res, { ok: true });
     }
+  }
 
-    if (parts.length === 4 && parts[3] === 'leave') {
-      if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
-      const me = await getUser(req);
-      if (!me) return err(res, 'Not authenticated', 401);
-      let body; try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
-      const { teamId } = body;
-      const team = await col.teams.findOne({ id: teamId, members: me.id });
-      if (!team) return err(res, 'Team not found', 404);
-      if (team.ownerId === me.id) return err(res, 'Owner cannot leave team, delete instead');
-      await col.teams.updateOne({ id: teamId }, { $pull: { members: me.id } });
-      return json(res, { ok: true });
+  const teamSubGetMatch = pathname.match(/^\/api\/teams\/([a-f0-9]{24})\/(messages|files)$/);
+  if (teamSubGetMatch && method === 'GET') {
+    if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+    const me = await getUser(req);
+    if (!me) return err(res, 'Not authenticated', 401);
+    const teamId   = teamSubGetMatch[1];
+    const subRoute = teamSubGetMatch[2];
+    const team = await col.teams.findOne({ id: teamId, members: me.id });
+    if (!team) return err(res, 'Team not found', 404);
+
+    if (subRoute === 'messages') {
+      const since = parseInt(url.searchParams.get('since') || '0');
+      const query = { teamId };
+      if (since) query.created = { $gt: since };
+      const messages = await col.teamMessages.find(query).sort({ created: 1 }).limit(200).toArray();
+      const safe = messages.map(m => { const r = {...m}; delete r._id; return r; });
+      return json(res, safe);
     }
 
-    if (parts.length === 4 && parts[3] === 'messages') {
-      if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
-      const me = await getUser(req);
-      if (!me) return err(res, 'Not authenticated', 401);
-      let body; try { body = await parseBody(req); } catch { return err(res, 'Invalid request', 400); }
-      const { teamId, text } = body;
-      if (!text || text.length > 500) return err(res, 'Message text required (max 500 chars)');
-      const team = await col.teams.findOne({ id: teamId, members: me.id });
-      if (!team) return err(res, 'Team not found', 404);
-
-      const message = {
-        id:       uid(),
-        teamId,
-        userId:   me.id,
-        text:     sanitizeText(text, 500),
-        created:  Date.now(),
-      };
-      await col.teamMessages.insertOne(message);
-      const r = {...message}; delete r._id;
-      return json(res, r);
+    if (subRoute === 'files') {
+      const files = await col.teamFiles.find({ teamId }, { projection: { data: 0 } }).sort({ created: -1 }).limit(50).toArray();
+      const safe = files.map(f => { const r = {...f}; delete r._id; r.url = `/api/teams/${teamId}/files/${r.id}`; return r; });
+      return json(res, safe);
     }
   }
 
-  if (pathname.startsWith('/api/teams/') && method === 'GET') {
-    const parts = pathname.split('/');
-    if (parts.length === 4 && parts[3] === 'messages') {
-      if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
-      const me = await getUser(req);
-      if (!me) return err(res, 'Not authenticated', 401);
-      const teamId = parts[2];
-      const team = await col.teams.findOne({ id: teamId, members: me.id });
-      if (!team) return err(res, 'Team not found', 404);
-      const messages = await col.teamMessages.find({ teamId }).sort({ created: 1 }).limit(100).toArray();
-      const messagesSafe = messages.map(m => { const r = {...m}; delete r._id; return r; });
-      return json(res, messagesSafe);
-    }
+  // Serve file data
+  const teamFileGetMatch = pathname.match(/^\/api\/teams\/([a-f0-9]{24})\/files\/([a-f0-9]{24})$/);
+  if (teamFileGetMatch && method === 'GET') {
+    if (!checkRateLimit(ip, 'api')) return err(res, 'Too many requests', 429);
+    const me = await getUser(req);
+    if (!me) return err(res, 'Not authenticated', 401);
+    const teamId = teamFileGetMatch[1];
+    const fileId = teamFileGetMatch[2];
+    const team = await col.teams.findOne({ id: teamId, members: me.id });
+    if (!team) return err(res, 'Team not found', 404);
+    const file = await col.teamFiles.findOne({ id: fileId, teamId });
+    if (!file) return err(res, 'File not found', 404);
+    const buf = Buffer.from(file.data.split(',').pop(), 'base64');
+    res.writeHead(200, {
+      'Content-Type': file.type || 'application/octet-stream',
+      'Content-Disposition': `inline; filename="${encodeURIComponent(file.name)}"`,
+      'Cache-Control': 'private, max-age=86400',
+    });
+    return res.end(buf);
   }
 
   // ─── ADMIN ──────────────────────────────────────────────────────────────────
@@ -933,6 +1044,25 @@ const server = http.createServer(async (req, res) => {
         return { list, pending };
       })();
 
+      // Fetch teams data for admin
+      const allTeams = await col.teams.find({}).toArray();
+      const totalMsgs = await col.teamMessages.countDocuments({});
+      const teamsWithDetails = await Promise.all(allTeams.map(async t => {
+        const owner = users.find(u => u.id === t.ownerId);
+        const msgCount = await col.teamMessages.countDocuments({ teamId: t.id });
+        return {
+          id: t.id, name: t.name, emoji: t.emoji || '🚀',
+          inviteCode: t.inviteCode || '—',
+          hasPassword: !!t.passHash,
+          ownerId: t.ownerId,
+          ownerName: owner?.username || '?',
+          memberCount: t.members?.length || 0,
+          memberNames: t.members?.map(mid => users.find(u => u.id === mid)?.username || mid) || [],
+          msgCount,
+          created: new Date(t.created).toISOString().slice(0, 10),
+        };
+      }));
+
       return json(res, {
         stats: {
           totalUsers:      users.length,
@@ -944,6 +1074,8 @@ const server = http.createServer(async (req, res) => {
           activeToday:     users.filter(u => u.lastSeen?.startsWith(todayStr)).length,
           activeSessions:  sessions,
           friendshipCount, pendingRequests: pendingCount,
+          totalTeams:      allTeams.length,
+          totalMessages:   totalMsgs,
           avgScore:  userStats.length ? Math.round(userStats.reduce((s,u)=>s+u.score,0)/userStats.length) : 0,
           avgStreak: userStats.length ? Math.round(userStats.reduce((s,u)=>s+u.streak,0)/userStats.length) : 0,
         },
@@ -951,6 +1083,7 @@ const server = http.createServer(async (req, res) => {
         full:  { tasks: tasksByUser, habits, habitLog: {} },
         friendships,
         dailyStats,
+        teams: teamsWithDetails,
       });
     }
 
